@@ -1,1 +1,2 @@
-print("hello world")
+from ultralytics import YOLO
+
