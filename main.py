@@ -1,12 +1,13 @@
+from ultralytics import YOLO
+
 from classifier import BALL_PERSISTANCE_PATH, PERSISTANCE_PATH, Classifier
-from compute import Compute
 from merge import merge_fragmented_tracks
 from teams import save_ball_positions, save_teams
 
 
 def main():
-    p = Compute(Classifier.From_saved())
-    p.print_details()
+    model = YOLO("yolo26n-seg.pt")
+    print("loaded")
 
 
 def process_video(fp: str):

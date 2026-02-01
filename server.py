@@ -14,10 +14,12 @@ image = (
         "numpy",
         "scikit-learn",
         "torch",
-        "transformers==4.40.0",
+        "transformers>=4.46.0",
         "lap",
+        "qwen-vl-utils",
+        "accelerate",
     )
-    .add_local_file("yolo26n.pt", "/root/yolo26n.pt")
+    .add_local_file("yolo26n-seg.pt", "/root/yolo26n-seg.pt")
     .add_local_dir(".", "/root/app")
 )
 
@@ -36,7 +38,7 @@ with image.imports():
 class Worker:
     @modal.enter()
     def setup(self):
-        self.yolo = YOLO("/root/yolo26n.pt")
+        self.yolo = YOLO("/root/yolo26n-seg.pt")
         self.embed_model = EmbeddingModel()
 
     @modal.method()

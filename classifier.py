@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-from sklearn.cluster import KMeans
+from PIL import Image
 from ultralytics import YOLO
 from ultralytics.engine.results import Boxes, Results
 
@@ -11,6 +11,14 @@ from teams import Player, Team, load_ball_positions, load_teams, save_ball_posit
 
 PERSISTANCE_PATH = "output/teams.json"
 BALL_PERSISTANCE_PATH = "output/ball_positions.json"
+
+
+def apply_mask_to_crop(frame: np.ndarray, box_coords: tuple, mask: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2 = box_coords
+    cropped = frame[y1:y2, x1:x2].copy()
+    mask_cropped = mask[y1:y2, x1:x2]
+    cropped[mask_cropped == 0] = 0
+    return cropped
 
 
 class Classifier:
@@ -23,6 +31,7 @@ class Classifier:
         self.ball_positions = _ball_positions if _ball_positions else {}
         self._embeddings: dict[int, np.ndarray] = {}
         self._team_centroids: tuple[np.ndarray, np.ndarray] | None = None
+        self._team_colors: tuple[str, str] | None = None
         self._embed_model: EmbeddingModel | None = None
 
     @staticmethod
@@ -30,7 +39,8 @@ class Classifier:
         if not Path(fp).exists():
             raise ValueError("Invalid file path")
 
-        model = yolo if yolo is not None else YOLO("yolo26n.pt")
+        model = yolo if yolo is not None else YOLO("yolo26n-seg.pt")
+
         results = model.track(
             source=fp,
             tracker="bytetrack.yaml",
@@ -57,10 +67,15 @@ class Classifier:
     def From_saved() -> "Classifier":
         return Classifier(load_teams(PERSISTANCE_PATH), load_ball_positions(BALL_PERSISTANCE_PATH))
 
-    def _get_embedding(self, frame: NDArray[np.uint8], box: Boxes) -> np.ndarray:
+    def _get_embedding(
+        self, frame: NDArray[np.uint8], box: Boxes, mask: np.ndarray = None
+    ) -> np.ndarray:
         coords = box.xyxy[0].cpu().numpy().astype(int)
         x1, y1, x2, y2 = coords
-        cropped = frame[y1:y2, x1:x2]
+        if mask is not None:
+            cropped = apply_mask_to_crop(frame, (x1, y1, x2, y2), mask)
+        else:
+            cropped = frame[y1:y2, x1:x2]
         return self._embed_model.get_embedding(cropped)
 
     def _closest_team(self, embedding: np.ndarray) -> tuple[Team, int]:
@@ -76,6 +91,22 @@ class Classifier:
             ids.update(team.players.keys())
         return ids
 
+    def _get_masks_dict(self, result: Results) -> dict[int, np.ndarray]:
+        masks_dict = {}
+        if result.masks is None:
+            return masks_dict
+        h, w = result.orig_img.shape[:2]
+        for i, box in enumerate(result.boxes):
+            if box.id is None:
+                continue
+            track_id = int(box.id.item())
+            mask_tensor = result.masks.data[i]
+            mask_resized = np.array(
+                Image.fromarray(mask_tensor.cpu().numpy()).resize((w, h), Image.NEAREST)
+            )
+            masks_dict[track_id] = mask_resized
+        return masks_dict
+
     def _assign_teams(self, result: Results, frame_idx: int):
         people = [
             (box, int(box.id.item()))
@@ -89,14 +120,23 @@ class Classifier:
             coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
             self.ball_positions[frame_idx] = coords
 
+        masks_dict = self._get_masks_dict(result)
+
         if frame_idx == 0:
-            # instantiate teams on first frame
+            color1, color2 = self._embed_model.get_team_colors_from_scene(result.orig_img)
+            self._team_colors = (color1, color2)
+            self.teams = (Team(color1), Team(color2))
+
             crops = []
             track_ids_list = []
             for box, track_id in people:
                 coords = box.xyxy[0].cpu().numpy().astype(int)
                 x1, y1, x2, y2 = coords
-                cropped = result.orig_img[y1:y2, x1:x2]
+                mask = masks_dict.get(track_id)
+                if mask is not None:
+                    cropped = apply_mask_to_crop(result.orig_img, (x1, y1, x2, y2), mask)
+                else:
+                    cropped = result.orig_img[y1:y2, x1:x2]
                 crops.append(cropped)
                 track_ids_list.append(track_id)
 
@@ -104,43 +144,50 @@ class Classifier:
             for i, track_id in enumerate(track_ids_list):
                 self._embeddings[track_id] = embeddings_array[i]
 
-            kmeans = KMeans(n_clusters=3, n_init=10, random_state=42)
-            labels = kmeans.fit_predict(embeddings_array)
-
-            cluster_sizes = [np.sum(labels == i) for i in range(3)]
-            sorted_clusters = sorted(range(3), key=lambda i: cluster_sizes[i], reverse=True)
-            team1_label, team2_label = sorted_clusters[0], sorted_clusters[1]
-
-            self._team_centroids = (
-                kmeans.cluster_centers_[team1_label],
-                kmeans.cluster_centers_[team2_label],
-            )
-
-            team1_crops = [crops[i] for i, label in enumerate(labels) if label == team1_label]
-            team2_crops = [crops[i] for i, label in enumerate(labels) if label == team2_label]
-            color1 = self._embed_model.get_color_from_crops(team1_crops)
-            color2 = self._embed_model.get_color_from_crops(team2_crops)
-            self.teams = (Team(color1), Team(color2))
-
-            label_map = {team1_label: 0, team2_label: 1}
-            labels = np.array([label_map.get(l, -1) for l in labels])
+            team1_embeddings = []
+            team2_embeddings = []
 
             for idx, (box, track_id) in enumerate(people):
-                label = labels[idx]
+                coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
+                label = self._embed_model.classify_player_by_color(crops[idx], self._team_colors)
                 if label == -1:
                     continue
                 player = Player(track_id)
-                coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
                 player.add_position(frame_idx, coords)
                 self.teams[label].players[track_id] = player
+
+                if label == 0:
+                    team1_embeddings.append(embeddings_array[idx])
+                else:
+                    team2_embeddings.append(embeddings_array[idx])
+
+            if team1_embeddings and team2_embeddings:
+                self._team_centroids = (
+                    np.mean(team1_embeddings, axis=0),
+                    np.mean(team2_embeddings, axis=0),
+                )
         else:
             known_ids = self._get_all_player_ids()
             for box, track_id in people:
                 coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
                 if track_id not in known_ids:
-                    emb = self._get_embedding(result.orig_img, box)
+                    mask = masks_dict.get(track_id)
+                    emb = self._get_embedding(result.orig_img, box, mask)
                     self._embeddings[track_id] = emb
-                    team, _ = self._closest_team(emb)
+
+                    if self._team_centroids is not None:
+                        team, _ = self._closest_team(emb)
+                    else:
+                        x1, y1, x2, y2 = coords
+                        if mask is not None:
+                            crop = apply_mask_to_crop(result.orig_img, (x1, y1, x2, y2), mask)
+                        else:
+                            crop = result.orig_img[y1:y2, x1:x2]
+                        label = self._embed_model.classify_player_by_color(crop, self._team_colors)
+                        if label == -1:
+                            continue
+                        team = self.teams[label]
+
                     player = Player(track_id)
                     player.add_position(frame_idx, coords)
                     team.players[track_id] = player

@@ -33,7 +33,7 @@ def spatially_plausible(p1, p2, max_distance=200) -> bool:
     return ((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2) ** 0.5 < max_distance
 
 
-def find_merge_candidates(team: Team, embeddings: dict[int, np.ndarray], similarity_threshold=0.89):
+def find_merge_candidates(team: Team, embeddings: dict[int, np.ndarray], similarity_threshold=0.88):
     pairs = []
     track_ids = list(team.players.keys())
     for i, id1 in enumerate(track_ids):
@@ -52,7 +52,7 @@ def find_merge_candidates(team: Team, embeddings: dict[int, np.ndarray], similar
 def merge_fragmented_tracks(
     teams: tuple[Team, Team],
     embeddings: dict[int, np.ndarray],
-    similarity_threshold=0.89,
+    similarity_threshold=0.88,
 ):
     for team in teams:
         pairs = find_merge_candidates(team, embeddings, similarity_threshold)
