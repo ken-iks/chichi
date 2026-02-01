@@ -39,19 +39,19 @@ class Player:
 
 
 class Team:
-    def __init__(self, color: tuple[int, int, int]):
+    def __init__(self, color: str):
         self.team_color = color
         self.players: dict[int, Player] = {}
 
     def to_dict(self) -> dict:
         return {
-            "team_color": list(self.team_color),
+            "team_color": self.team_color,
             "players": {str(k): v.to_dict() for k, v in self.players.items()},
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Team":
-        team = cls(tuple(data["team_color"]))
+        team = cls(data["team_color"])
         team.players = {int(k): Player.from_dict(v) for k, v in data["players"].items()}
         return team
 

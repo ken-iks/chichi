@@ -6,6 +6,7 @@ from sklearn.cluster import KMeans
 from ultralytics import YOLO
 from ultralytics.engine.results import Boxes, Results
 
+from embeddings import EmbeddingModel
 from teams import Player, Team, load_ball_positions, load_teams, save_ball_positions, save_teams
 
 PERSISTANCE_PATH = "output/teams.json"
@@ -20,13 +21,16 @@ class Classifier:
     ):
         self.teams = _teams
         self.ball_positions = _ball_positions if _ball_positions else {}
+        self._embeddings: dict[int, np.ndarray] = {}
+        self._team_centroids: tuple[np.ndarray, np.ndarray] | None = None
+        self._embed_model: EmbeddingModel | None = None
 
     @staticmethod
-    def New(fp: str, persist: bool) -> "Classifier":
+    def New(fp: str, persist: bool, yolo=None, embed_model=None) -> "Classifier":
         if not Path(fp).exists():
             raise ValueError("Invalid file path")
 
-        model = YOLO("yolo26n.pt")
+        model = yolo if yolo is not None else YOLO("yolo26n.pt")
         results = model.track(
             source=fp,
             tracker="bytetrack.yaml",
@@ -34,6 +38,8 @@ class Classifier:
             stream=True,
         )
         cl = Classifier()
+        cl._embed_model = embed_model if embed_model is not None else EmbeddingModel()
+
         for i, res in enumerate(results):
             if res.boxes is not None:
                 cl._assign_teams(res, i)
@@ -51,21 +57,18 @@ class Classifier:
     def From_saved() -> "Classifier":
         return Classifier(load_teams(PERSISTANCE_PATH), load_ball_positions(BALL_PERSISTANCE_PATH))
 
-    @staticmethod
-    def _get_dominant_color(frame: NDArray[np.uint8], box: Boxes) -> NDArray[np.int_]:
+    def _get_embedding(self, frame: NDArray[np.uint8], box: Boxes) -> np.ndarray:
         coords = box.xyxy[0].cpu().numpy().astype(int)
         x1, y1, x2, y2 = coords
-        cropped = frame[y1:y2, x1:x2]  # numpy is row major so reshaped
-        # flatten image into a list of pixels
-        pixels = cropped.reshape(-1, 3).astype(np.float32)
-        kmeans = KMeans(n_clusters=1, n_init=10)
-        kmeans.fit(pixels)
-        return kmeans.cluster_centers_[0].astype(np.int_)
+        cropped = frame[y1:y2, x1:x2]
+        return self._embed_model.get_embedding(cropped)
 
-    def _closest_team(self, color: NDArray[np.int_]) -> Team:
-        dist1 = np.linalg.norm(color - np.array(self.teams[0].team_color))
-        dist2 = np.linalg.norm(color - np.array(self.teams[1].team_color))
-        return self.teams[0] if dist1 < dist2 else self.teams[1]
+    def _closest_team(self, embedding: np.ndarray) -> tuple[Team, int]:
+        dist1 = np.linalg.norm(embedding - self._team_centroids[0])
+        dist2 = np.linalg.norm(embedding - self._team_centroids[1])
+        if dist1 < dist2:
+            return self.teams[0], 0
+        return self.teams[1], 1
 
     def _get_all_player_ids(self) -> set[int]:
         ids = set()
@@ -88,17 +91,44 @@ class Classifier:
 
         if frame_idx == 0:
             # instantiate teams on first frame
-            colors = np.array(
-                [self._get_dominant_color(result.orig_img, box) for box, _ in people]
-            ).reshape(-1, 3)
-            kmeans = KMeans(n_clusters=2, n_init=10)
-            labels = kmeans.fit_predict(colors)
-            team1_color = tuple(int(x) for x in kmeans.cluster_centers_[0])
-            team2_color = tuple(int(x) for x in kmeans.cluster_centers_[1])
+            crops = []
+            track_ids_list = []
+            for box, track_id in people:
+                coords = box.xyxy[0].cpu().numpy().astype(int)
+                x1, y1, x2, y2 = coords
+                cropped = result.orig_img[y1:y2, x1:x2]
+                crops.append(cropped)
+                track_ids_list.append(track_id)
 
-            self.teams = (Team(team1_color), Team(team2_color))
+            embeddings_array = self._embed_model.get_embeddings_batch(crops)
+            for i, track_id in enumerate(track_ids_list):
+                self._embeddings[track_id] = embeddings_array[i]
 
-            for (box, track_id), label in zip(people, labels):
+            kmeans = KMeans(n_clusters=3, n_init=10, random_state=42)
+            labels = kmeans.fit_predict(embeddings_array)
+
+            cluster_sizes = [np.sum(labels == i) for i in range(3)]
+            sorted_clusters = sorted(range(3), key=lambda i: cluster_sizes[i], reverse=True)
+            team1_label, team2_label = sorted_clusters[0], sorted_clusters[1]
+
+            self._team_centroids = (
+                kmeans.cluster_centers_[team1_label],
+                kmeans.cluster_centers_[team2_label],
+            )
+
+            team1_crops = [crops[i] for i, label in enumerate(labels) if label == team1_label]
+            team2_crops = [crops[i] for i, label in enumerate(labels) if label == team2_label]
+            color1 = self._embed_model.get_color_from_crops(team1_crops)
+            color2 = self._embed_model.get_color_from_crops(team2_crops)
+            self.teams = (Team(color1), Team(color2))
+
+            label_map = {team1_label: 0, team2_label: 1}
+            labels = np.array([label_map.get(l, -1) for l in labels])
+
+            for idx, (box, track_id) in enumerate(people):
+                label = labels[idx]
+                if label == -1:
+                    continue
                 player = Player(track_id)
                 coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
                 player.add_position(frame_idx, coords)
@@ -108,8 +138,9 @@ class Classifier:
             for box, track_id in people:
                 coords = tuple(int(x) for x in box.xyxy[0].cpu().numpy())
                 if track_id not in known_ids:
-                    color = self._get_dominant_color(result.orig_img, box)
-                    team = self._closest_team(color)
+                    emb = self._get_embedding(result.orig_img, box)
+                    self._embeddings[track_id] = emb
+                    team, _ = self._closest_team(emb)
                     player = Player(track_id)
                     player.add_position(frame_idx, coords)
                     team.players[track_id] = player
