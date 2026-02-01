@@ -64,3 +64,13 @@ def save_teams(teams: tuple["Team", "Team"], path: str):
 def load_teams(path: str) -> tuple["Team", "Team"]:
     data = json.loads(Path(path).read_text())
     return (Team.from_dict(data[0]), Team.from_dict(data[1]))
+
+
+def save_ball_positions(positions: dict[int, tuple[int, int, int, int]], path: str):
+    data = {str(k): list(v) for k, v in positions.items()}
+    Path(path).write_text(json.dumps(data, indent=2))
+
+
+def load_ball_positions(path: str) -> dict[int, tuple[int, int, int, int]]:
+    data = json.loads(Path(path).read_text())
+    return {int(k): tuple(v) for k, v in data.items()}
